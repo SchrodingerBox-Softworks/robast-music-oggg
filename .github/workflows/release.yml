@@ -10,7 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  APP_NAME: audio-converter
+  APP_NAME: schrodinger-audio-converter
 
 jobs:
 
@@ -38,61 +38,19 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      # --------------------------------------------------------
-      # Download FFmpeg
-      # --------------------------------------------------------
-
-      - name: Download FFmpeg
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path assets/ffmpeg/windows
-
-          Invoke-WebRequest `
-            -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
-            -OutFile "ffmpeg.zip"
-
-          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg-temp"
-
-          $ffmpeg = Get-ChildItem `
-            -Path "ffmpeg-temp" `
-            -Filter "ffmpeg.exe" `
-            -Recurse `
-            | Select-Object -First 1
-
-          if (-not $ffmpeg) {
-            Write-Error "ffmpeg.exe not found"
-            exit 1
-          }
-
-          Copy-Item `
-            $ffmpeg.FullName `
-            "assets/ffmpeg/windows/ffmpeg.exe"
-
-          Remove-Item "ffmpeg.zip"
-          Remove-Item "ffmpeg-temp" -Recurse -Force
-
-          Write-Host "FFmpeg installed:"
-          Get-Item "assets/ffmpeg/windows/ffmpeg.exe"
-
-      # --------------------------------------------------------
-      # Build
-      # --------------------------------------------------------
+      # Static ffmpeg.exe is downloaded and embedded by build.rs
+      # so the shipped Windows binary is a single self-contained .exe.
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --features bundle-ffmpeg
 
       - name: Test
         run: cargo test --release --locked
-
-      # --------------------------------------------------------
-      # Package
-      # --------------------------------------------------------
 
       - name: Package
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-
           New-Item -ItemType Directory -Force -Path "release"
 
           Copy-Item `
@@ -103,15 +61,11 @@ jobs:
             Copy-Item "LICENSE" "release/LICENSE"
           }
 
-          Compress-Archive `
-            -Path "release/*" `
-            -DestinationPath "${env:APP_NAME}-${tag}-windows-x64.zip"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: ${{ env.APP_NAME }}-${{ github.ref_name }}-windows-x64.zip
+          path: release/${{ env.APP_NAME }}-windows-x64.exe
 
 
   # ============================================================
@@ -186,7 +140,7 @@ jobs:
       # --------------------------------------------------------
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --features bundle-ffmpeg
 
       - name: Test
         run: cargo test --release --locked

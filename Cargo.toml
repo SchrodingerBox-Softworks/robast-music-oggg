@@ -1,27 +1,27 @@
 [package]
 name = "schrodinger-audio-converter"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[features]
+default = []
+bundle-ffmpeg = []
 
 [dependencies]
-eframe = { version = "0.35", default-features = false, features = [
-    "default_fonts",
-    "glow",
-    "persistence"
-] }
-
-egui_extras = "0.35"
-
-image = { version = "0.25", default-features = false, features = ["png"] }
-
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
-rfd = "0.15"
-
-walkdir = "2"
-
-rayon = "1"
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
 
 [build-dependencies]
 winresource = "0.1"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
