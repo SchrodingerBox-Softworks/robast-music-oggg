@@ -1,0 +1,6 @@
+pyautogui>=0.9.54
+pynput>=1.7.6
+Pillow>=10.0.0
+# опционально, чтобы читать число патронов из окна осмотра:
+# pytesseract
+# и поставь Tesseract OCR: https://github.com/UB-Mannheim/tesseract/wiki  (языки rus+eng)
