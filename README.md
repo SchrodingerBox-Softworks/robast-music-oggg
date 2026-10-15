@@ -1,4 +1,16 @@
-# Schrödinger — конвертер в OGG
+# robast-music-oggg - Конвертер в OGG
+
+[![Made with Rust](https://img.shields.io/badge/made%20with-Rust%20🦀-dea584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Blazingly fast](https://img.shields.io/badge/blazingly-fast%20🚀-ff4500?style=for-the-badge)](https://www.rust-lang.org/)
+[![Memory safe](https://img.shields.io/badge/memory-safe%20🔒-2ea44f?style=for-the-badge)](https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html)
+[![Zero cost abstractions](https://img.shields.io/badge/zero--cost-abstractions-8a2be2?style=for-the-badge)](https://doc.rust-lang.org/book/)
+
+[![Release](https://img.shields.io/github/v/release/SchrodingerBox-Softworks/robast-music-oggg?style=flat-square&logo=github)](https://github.com/SchrodingerBox-Softworks/robast-music-oggg/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/SchrodingerBox-Softworks/robast-music-oggg/release.yml?style=flat-square&label=build)](https://github.com/SchrodingerBox-Softworks/robast-music-oggg/actions/workflows/release.yml)
+[![Downloads](https://img.shields.io/github/downloads/SchrodingerBox-Softworks/robast-music-oggg/total?style=flat-square)](https://github.com/SchrodingerBox-Softworks/robast-music-oggg/releases)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-informational?style=flat-square)
+[![egui](https://img.shields.io/badge/GUI-egui-blue?style=flat-square)](https://github.com/emilk/egui)
+[![FFmpeg](https://img.shields.io/badge/powered%20by-FFmpeg-007808?style=flat-square&logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
 
 Настольное приложение для пакетной конвертации аудио в **OGG Vorbis**. Перетащите файлы или папки в окно, выберите качество и нажмите «Конвертировать».
 
