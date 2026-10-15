@@ -1,6 +1,9 @@
 mod ffmpeg;
 
-use eframe::egui::{self, Color32, Frame, Margin, RichText, Rounding, ScrollArea, Stroke, Vec2};
+use eframe::egui::{
+    self, Align, Align2, Color32, FontId, Frame, Key, Layout, Margin, Modifiers, RichText,
+    Rounding, ScrollArea, Sense, Stroke, TextStyle, Vec2,
+};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,6 +17,7 @@ use std::{
         Arc,
     },
     thread,
+    time::Duration,
 };
 
 #[cfg(target_os = "windows")]
@@ -25,16 +29,30 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 ];
 
 const ACCENT: Color32 = Color32::from_rgb(98, 168, 255);
-const ACCENT_SOFT: Color32 = Color32::from_rgb(64, 112, 186);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(52, 104, 182);
 const BG: Color32 = Color32::from_rgb(12, 14, 20);
 const PANEL: Color32 = Color32::from_rgb(20, 24, 34);
 const PANEL_INNER: Color32 = Color32::from_rgb(16, 19, 28);
+const ROW_HOVER: Color32 = Color32::from_rgb(28, 34, 48);
+const SELECTED_BG: Color32 = Color32::from_rgb(30, 50, 84);
 const STROKE: Color32 = Color32::from_rgb(46, 54, 72);
 const TEXT: Color32 = Color32::from_rgb(230, 235, 245);
 const MUTED: Color32 = Color32::from_rgb(140, 150, 168);
 const OK: Color32 = Color32::from_rgb(92, 214, 148);
 const ERR: Color32 = Color32::from_rgb(255, 110, 118);
 const WARN: Color32 = Color32::from_rgb(255, 196, 92);
+const STOP_BG: Color32 = Color32::from_rgb(110, 44, 54);
+
+/// Готовые уровни качества: (значение -q:a, название).
+const QUALITY_PRESETS: &[(i32, &str)] = &[
+    (2, "Компактно"),
+    (4, "Речь, подкасты"),
+    (6, "Музыка"),
+    (8, "Высокое"),
+    (10, "Максимум"),
+];
+
+const NOTICE_SECONDS: f64 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Channels {
@@ -54,6 +72,13 @@ impl Channels {
         match self {
             Self::Mono => "Моно",
             Self::Stereo => "Стерео",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Mono => "Один канал: меньше размер, подходит для речи",
+            Self::Stereo => "Два канала: для музыки",
         }
     }
 }
@@ -84,7 +109,7 @@ impl SampleRate {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Settings {
     channels: Channels,
     quality: i32,
@@ -100,7 +125,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             channels: Channels::Stereo,
-            quality: 5,
+            quality: 6,
             recursive: true,
             overwrite: true,
             sample_rate: SampleRate::Source,
@@ -110,14 +135,27 @@ impl Default for Settings {
 }
 
 impl Settings {
-    fn quality_hint(quality: i32) -> &'static str {
+    /// Номинальный битрейт libvorbis для стерео 44.1 кГц.
+    fn quality_kbps(quality: i32) -> u32 {
         match quality {
-            0..=2 => "~64–96 кбит/с · компактно",
-            3..=4 => "~112–128 кбит/с · речь / подкаст",
-            5..=6 => "~160–192 кбит/с · музыка",
-            7..=8 => "~224–256 кбит/с · высокое",
-            _ => "~320 кбит/с · почти без потерь",
+            i32::MIN..=0 => 64,
+            1 => 80,
+            2 => 96,
+            3 => 112,
+            4 => 128,
+            5 => 160,
+            6 => 192,
+            7 => 224,
+            8 => 256,
+            9 => 320,
+            _ => 500,
         }
+    }
+
+    fn quality_hint(quality: i32) -> String {
+        let kbps = Self::quality_kbps(quality);
+        let mb_per_min = kbps as f32 * 60.0 / 8.0 / 1024.0;
+        format!("≈{kbps} кбит/с · ≈{mb_per_min:.1} МБ за минуту")
     }
 }
 
@@ -133,11 +171,21 @@ enum FileStatus {
 impl FileStatus {
     fn label(self) -> &'static str {
         match self {
-            Self::Queued => "в очереди",
-            Self::Running => "идёт",
+            Self::Queued => "ожидает",
+            Self::Running => "конвертируется…",
             Self::Success => "готово",
-            Self::Skipped => "пропуск",
+            Self::Skipped => "пропущен",
             Self::Failed => "ошибка",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Queued => "○",
+            Self::Running => "▶",
+            Self::Success => "✔",
+            Self::Skipped => "⏭",
+            Self::Failed => "✖",
         }
     }
 
@@ -181,23 +229,43 @@ enum WorkerMessage {
     Finished,
 }
 
+enum FfmpegState {
+    Preparing,
+    Ready(PathBuf),
+    Failed(String),
+}
+
+#[derive(Default)]
+struct Stats {
+    queued: usize,
+    success: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+struct Notice {
+    color: Color32,
+    text: String,
+    until: f64,
+}
+
 struct App {
     files: Vec<QueueFile>,
-    output_dir: Option<PathBuf>,
     settings: Settings,
+    saved_settings: Settings,
     converting: bool,
+    stopping: bool,
     current_file: Option<PathBuf>,
     completed: usize,
     total: usize,
-    success_count: usize,
-    fail_count: usize,
-    skip_count: usize,
     logs: Vec<(Color32, String)>,
+    log_open: bool,
     rx: Option<Receiver<WorkerMessage>>,
     cancel: Option<Arc<AtomicBool>>,
-    ffmpeg_path: Option<PathBuf>,
+    ffmpeg: FfmpegState,
     ffmpeg_rx: Option<Receiver<Result<PathBuf, String>>>,
-    status: String,
+    notice: Option<Notice>,
+    pending_notice: Option<(Color32, String)>,
     dragging: bool,
 }
 
@@ -205,21 +273,21 @@ impl Default for App {
     fn default() -> Self {
         Self {
             files: Vec::new(),
-            output_dir: None,
             settings: Settings::default(),
+            saved_settings: Settings::default(),
             converting: false,
+            stopping: false,
             current_file: None,
             completed: 0,
             total: 0,
-            success_count: 0,
-            fail_count: 0,
-            skip_count: 0,
             logs: Vec::new(),
+            log_open: false,
             rx: None,
             cancel: None,
-            ffmpeg_path: None,
+            ffmpeg: FfmpegState::Preparing,
             ffmpeg_rx: None,
-            status: "Готов к работе".to_string(),
+            notice: None,
+            pending_notice: None,
             dragging: false,
         }
     }
@@ -235,8 +303,15 @@ impl App {
         app
     }
 
+    fn ffmpeg_path(&self) -> Option<&PathBuf> {
+        match &self.ffmpeg {
+            FfmpegState::Ready(path) => Some(path),
+            _ => None,
+        }
+    }
+
     fn start_ffmpeg_setup(&mut self) {
-        self.status = "Подготовка FFmpeg…".to_string();
+        self.ffmpeg = FfmpegState::Preparing;
         self.log(MUTED, "Готовлю FFmpeg для конвертации…");
 
         let (tx, rx) = mpsc::channel();
@@ -261,15 +336,12 @@ impl App {
         self.ffmpeg_rx = None;
         match result {
             Ok(path) => {
-                self.ffmpeg_path = Some(path);
-                if !self.converting {
-                    self.status = "Готов к работе".to_string();
-                }
-                self.log(MUTED, "FFmpeg готов. Можно конвертировать в OGG Vorbis.");
+                self.ffmpeg = FfmpegState::Ready(path);
+                self.log(MUTED, "FFmpeg готов.");
             }
             Err(e) => {
-                self.status = "Нет FFmpeg".to_string();
                 self.log(ERR, format!("FFmpeg: {e}"));
+                self.ffmpeg = FfmpegState::Failed(e);
             }
         }
     }
@@ -283,18 +355,20 @@ impl App {
         let path = Self::settings_path();
         if let Ok(data) = fs::read_to_string(path) {
             if let Ok(settings) = serde_json::from_str::<Settings>(&data) {
-                self.output_dir = settings.output_dir.clone();
                 self.settings = settings;
             }
         }
+        self.saved_settings = self.settings.clone();
     }
 
-    fn save_settings(&self) {
-        let path = Self::settings_path();
-        let mut settings = self.settings.clone();
-        settings.output_dir = self.output_dir.clone();
-        if let Ok(data) = serde_json::to_string_pretty(&settings) {
-            let _ = fs::write(path, data);
+    fn save_settings(&mut self) {
+        if self.settings == self.saved_settings {
+            return;
+        }
+        if let Ok(data) = serde_json::to_string_pretty(&self.settings) {
+            if fs::write(Self::settings_path(), data).is_ok() {
+                self.saved_settings = self.settings.clone();
+            }
         }
     }
 
@@ -305,6 +379,24 @@ impl App {
         }
     }
 
+    fn notify(&mut self, color: Color32, text: impl Into<String>) {
+        // Время кадра доступно только в update, поэтому показ откладывается до него.
+        self.pending_notice = Some((color, text.into()));
+    }
+
+    fn stats(&self) -> Stats {
+        let mut stats = Stats::default();
+        for file in &self.files {
+            match file.status {
+                FileStatus::Queued | FileStatus::Running => stats.queued += 1,
+                FileStatus::Success => stats.success += 1,
+                FileStatus::Skipped => stats.skipped += 1,
+                FileStatus::Failed => stats.failed += 1,
+            }
+        }
+        stats
+    }
+
     fn is_audio(path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
@@ -312,26 +404,75 @@ impl App {
             .unwrap_or(false)
     }
 
-    fn add_file(&mut self, path: PathBuf) {
-        if path.is_file() {
-            if !Self::is_audio(&path) {
-                return;
-            }
-            if self.files.iter().any(|f| f.path == path) {
-                return;
-            }
-            self.files.push(QueueFile {
-                path,
-                status: FileStatus::Queued,
-                message: String::new(),
-            });
-        } else if path.is_dir() {
-            self.add_directory(path);
+    /// Возвращает true, если файл добавлен в очередь.
+    fn push_file(&mut self, path: PathBuf) -> bool {
+        if self.files.iter().any(|f| f.path == path) {
+            return false;
         }
+        self.files.push(QueueFile {
+            path,
+            status: FileStatus::Queued,
+            message: String::new(),
+        });
+        true
     }
 
-    fn add_directory(&mut self, dir: PathBuf) {
+    fn add_paths(&mut self, paths: Vec<PathBuf>) {
+        let mut added = 0;
+        let mut not_audio = 0;
+        let mut duplicates = 0;
+        let mut empty_dirs = 0;
+
+        for path in paths {
+            if path.is_dir() {
+                let found = self.add_directory(path);
+                if found == 0 {
+                    empty_dirs += 1;
+                }
+                added += found;
+            } else if path.is_file() {
+                if !Self::is_audio(&path) {
+                    not_audio += 1;
+                } else if self.push_file(path) {
+                    added += 1;
+                } else {
+                    duplicates += 1;
+                }
+            }
+        }
+
+        let mut parts = Vec::new();
+        if added > 0 {
+            parts.push(format!("Добавлено: {added}"));
+        }
+        if duplicates > 0 {
+            parts.push(format!("уже в списке: {duplicates}"));
+        }
+        if not_audio > 0 {
+            parts.push(format!("не аудио: {not_audio}"));
+        }
+        if empty_dirs > 0 && added == 0 {
+            parts.push(if self.settings.recursive {
+                "в папке нет аудиофайлов".to_string()
+            } else {
+                "в папке нет аудио (включите «С подпапками»)".to_string()
+            });
+        }
+        if parts.is_empty() {
+            return;
+        }
+        let color = if added > 0 { OK } else { WARN };
+        let mut text = parts.join(" · ");
+        if let Some(first) = text.get(0..1) {
+            text = first.to_uppercase() + &text[1..];
+        }
+        self.notify(color, text);
+    }
+
+    /// Добавляет аудио из папки, возвращает число новых файлов.
+    fn add_directory(&mut self, dir: PathBuf) -> usize {
         let mut stack = vec![dir];
+        let mut found = Vec::new();
 
         while let Some(current) = stack.pop() {
             let entries = match fs::read_dir(&current) {
@@ -352,9 +493,36 @@ impl App {
                         stack.push(path);
                     }
                 } else if path.is_file() && Self::is_audio(&path) {
-                    self.add_file(path);
+                    found.push(path);
                 }
             }
+        }
+
+        found.sort();
+        found
+            .into_iter()
+            .filter(|p| self.push_file(p.clone()))
+            .count()
+    }
+
+    fn pick_files(&mut self) {
+        if self.converting {
+            return;
+        }
+        if let Some(files) = FileDialog::new()
+            .add_filter("Аудио", AUDIO_EXTENSIONS)
+            .pick_files()
+        {
+            self.add_paths(files);
+        }
+    }
+
+    fn pick_folder(&mut self) {
+        if self.converting {
+            return;
+        }
+        if let Some(folder) = FileDialog::new().pick_folder() {
+            self.add_paths(vec![folder]);
         }
     }
 
@@ -364,6 +532,7 @@ impl App {
 
         for input in inputs {
             let output_dir = self
+                .settings
                 .output_dir
                 .clone()
                 .unwrap_or_else(|| input.parent().unwrap_or(Path::new(".")).to_path_buf());
@@ -389,35 +558,53 @@ impl App {
         result
     }
 
+    /// Сколько файлов уйдёт в работу по кнопке «Конвертировать».
+    fn files_to_convert(&self) -> usize {
+        let pending = self
+            .files
+            .iter()
+            .filter(|f| f.status != FileStatus::Success)
+            .count();
+        if pending == 0 {
+            self.files.len()
+        } else {
+            pending
+        }
+    }
+
     fn start_conversion(&mut self) {
         if self.converting {
             return;
         }
         if self.files.is_empty() {
-            self.log(WARN, "Нет файлов для конвертации.");
+            self.notify(WARN, "Сначала добавьте файлы");
             return;
         }
 
-        let ffmpeg = match &self.ffmpeg_path {
-            Some(path) => path.clone(),
-            None => {
-                self.log(ERR, "FFmpeg недоступен.");
-                return;
-            }
+        let Some(ffmpeg) = self.ffmpeg_path().cloned() else {
+            self.notify(ERR, "FFmpeg ещё не готов");
+            return;
         };
 
-        for file in &mut self.files {
-            file.status = FileStatus::Queued;
-            file.message.clear();
-        }
+        self.save_settings();
 
+        // Пути считаются по всему списку, чтобы имена не менялись между запусками.
         let inputs: Vec<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
         let outputs = self.build_output_paths(&inputs);
-        let files = inputs
-            .into_iter()
-            .zip(outputs)
-            .map(|(input, output)| AudioFile { input, output })
-            .collect::<Vec<_>>();
+
+        // Готовые файлы повторно не конвертируются, если только всё уже не готово.
+        let redo_all = self.files.iter().all(|f| f.status == FileStatus::Success);
+        let mut jobs = Vec::new();
+        for (file, output) in self.files.iter_mut().zip(outputs) {
+            if redo_all || file.status != FileStatus::Success {
+                file.status = FileStatus::Queued;
+                file.message.clear();
+                jobs.push(AudioFile {
+                    input: file.path.clone(),
+                    output,
+                });
+            }
+        }
 
         let channels = self.settings.channels;
         let quality = self.settings.quality;
@@ -430,22 +617,23 @@ impl App {
         self.rx = Some(rx);
         self.cancel = Some(cancel.clone());
         self.converting = true;
+        self.stopping = false;
         self.completed = 0;
-        self.total = files.len();
-        self.success_count = 0;
-        self.fail_count = 0;
-        self.skip_count = 0;
+        self.total = jobs.len();
         self.current_file = None;
-        self.status = "Конвертация…".to_string();
         self.log(
             ACCENT,
-            format!("Старт: {} файл(ов) → OGG Vorbis Q{quality}", files.len()),
+            format!(
+                "Старт: {} файл(ов) → OGG Vorbis Q{quality}, {}",
+                jobs.len(),
+                channels.label().to_lowercase()
+            ),
         );
 
         thread::spawn(move || {
             convert_job(
                 ffmpeg,
-                files,
+                jobs,
                 channels,
                 quality,
                 overwrite,
@@ -459,20 +647,14 @@ impl App {
     fn request_cancel(&mut self) {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::SeqCst);
-            self.status = "Остановка…".to_string();
+            self.stopping = true;
             self.log(WARN, "Остановка после текущего файла.");
         }
     }
 
     fn poll_conversion(&mut self) {
         let messages: Vec<WorkerMessage> = match &self.rx {
-            Some(rx) => {
-                let mut messages = Vec::new();
-                while let Ok(message) = rx.try_recv() {
-                    messages.push(message);
-                }
-                messages
-            }
+            Some(rx) => rx.try_iter().collect(),
             None => return,
         };
 
@@ -482,12 +664,10 @@ impl App {
                     self.total = total;
                 }
                 WorkerMessage::FileStarted { path } => {
-                    self.current_file = Some(path.clone());
                     if let Some(file) = self.files.iter_mut().find(|f| f.path == path) {
                         file.status = FileStatus::Running;
                     }
-                    let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("файл");
-                    self.status = format!("Конвертация: {name}");
+                    self.current_file = Some(path);
                 }
                 WorkerMessage::FileFinished {
                     path,
@@ -495,29 +675,37 @@ impl App {
                     message,
                 } => {
                     self.completed += 1;
-                    match status {
-                        FileStatus::Success => self.success_count += 1,
-                        FileStatus::Failed => self.fail_count += 1,
-                        FileStatus::Skipped => self.skip_count += 1,
-                        _ => {}
-                    }
                     if let Some(file) = self.files.iter_mut().find(|f| f.path == path) {
                         file.status = status;
                         file.message = message.clone();
                     }
-                    let color = status.color();
-                    let short = path.file_name().and_then(|x| x.to_str()).unwrap_or("файл");
-                    self.log(color, format!("{} · {short} · {message}", status.label()));
+                    let short = file_name(&path);
+                    self.log(
+                        status.color(),
+                        format!("{} · {short} · {message}", status.label()),
+                    );
                 }
                 WorkerMessage::Finished => {
                     self.converting = false;
+                    self.stopping = false;
                     self.current_file = None;
                     self.cancel = None;
-                    self.status = format!(
-                        "Готово · ок {}, ошибок {}, пропуск {}",
-                        self.success_count, self.fail_count, self.skip_count
+                    self.rx = None;
+                    let stats = self.stats();
+                    self.log(
+                        TEXT,
+                        format!(
+                            "Завершено: готово {}, ошибок {}, пропущено {}.",
+                            stats.success, stats.failed, stats.skipped
+                        ),
                     );
-                    self.log(TEXT, "Конвертация завершена.");
+                    if stats.failed > 0 {
+                        self.notify(
+                            ERR,
+                            format!("Ошибок: {}. Причина указана под именем файла", stats.failed),
+                        );
+                    }
+                    return;
                 }
             }
         }
@@ -542,448 +730,768 @@ impl App {
     }
 
     fn output_folder_to_open(&self) -> Option<PathBuf> {
-        if let Some(dir) = &self.output_dir {
+        if let Some(dir) = &self.settings.output_dir {
             return Some(dir.clone());
         }
         self.files
             .iter()
             .find(|f| f.status == FileStatus::Success)
+            .or_else(|| self.files.first())
             .and_then(|f| f.path.parent().map(|p| p.to_path_buf()))
-            .or_else(|| {
-                self.files
-                    .first()
-                    .and_then(|f| f.path.parent().map(|p| p.to_path_buf()))
-            })
     }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let (open_folder, open_files, convert, stop) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::O),
+                i.consume_key(Modifiers::COMMAND, Key::O),
+                i.consume_key(Modifiers::COMMAND, Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+            )
+        });
+        if open_folder {
+            self.pick_folder();
+        } else if open_files {
+            self.pick_files();
+        }
+        if convert {
+            self.start_conversion();
+        }
+        if stop && self.converting && !self.stopping {
+            self.request_cancel();
+        }
+    }
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        self.dragging = ctx.input(|input| !input.raw.hovered_files.is_empty());
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        if self.converting {
+            self.notify(WARN, "Во время конвертации добавлять файлы нельзя");
+            return;
+        }
+        self.add_paths(dropped);
+    }
+
+    // ───────────────────────────── UI ─────────────────────────────
 
     fn ui_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("SCHRÖDINGER")
-                        .color(ACCENT)
-                        .size(11.0)
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new("Конвертер в OGG")
-                        .color(TEXT)
-                        .size(20.0)
-                        .strong(),
-                );
-            });
+            ui.label(
+                RichText::new("Конвертер в OGG")
+                    .color(TEXT)
+                    .size(20.0)
+                    .strong(),
+            );
+            ui.label(RichText::new("Vorbis · Schrödinger").color(MUTED));
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let status_color = if self.ffmpeg_path.is_none() {
-                    ERR
-                } else if self.converting {
-                    ACCENT
-                } else if self.fail_count > 0 {
-                    ERR
-                } else {
-                    MUTED
-                };
-                ui.label(RichText::new(&self.status).color(status_color).size(14.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let mut retry = false;
+                match &self.ffmpeg {
+                    FfmpegState::Preparing => {
+                        ui.label(RichText::new("Подготовка FFmpeg…").color(MUTED));
+                        ui.spinner();
+                    }
+                    FfmpegState::Ready(path) => {
+                        ui.label(RichText::new("● FFmpeg готов").color(OK))
+                            .on_hover_text(path.display().to_string());
+                    }
+                    FfmpegState::Failed(error) => {
+                        retry = ui
+                            .button("Повторить")
+                            .on_hover_text("Снова попробовать найти или скачать FFmpeg")
+                            .clicked();
+                        ui.label(RichText::new("✖ FFmpeg недоступен").color(ERR))
+                            .on_hover_text(error);
+                    }
+                }
+                if retry {
+                    self.start_ffmpeg_setup();
+                }
             });
         });
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Настройки").strong().size(16.0).color(TEXT));
-        ui.add_space(12.0);
+        let enabled = !self.converting;
+        ui.add_enabled_ui(enabled, |ui| {
+            step_title(ui, "2", "Качество");
+            ui.add_space(4.0);
 
-        ui.label(RichText::new("Каналы").small().color(MUTED));
-        ui.horizontal(|ui| {
-            for channels in [Channels::Mono, Channels::Stereo] {
-                let selected = self.settings.channels == channels;
-                let btn = egui::Button::new(channels.label())
-                    .selected(selected)
-                    .min_size(Vec2::new(96.0, 28.0));
-                if ui.add_enabled(!self.converting, btn).clicked() {
-                    self.settings.channels = channels;
+            for &(quality, title) in QUALITY_PRESETS {
+                let selected = self.settings.quality == quality;
+                let kbps = format!("≈{} кбит/с", Settings::quality_kbps(quality));
+                if choice_row(ui, selected, title, &kbps).clicked() {
+                    self.settings.quality = quality;
                 }
             }
-        });
 
-        ui.add_space(12.0);
-        ui.label(RichText::new("Качество").small().color(MUTED));
-        ui.add_enabled_ui(!self.converting, |ui| {
-            ui.add(egui::Slider::new(&mut self.settings.quality, 0..=10).show_value(true));
-        });
-        ui.label(
-            RichText::new(format!(
-                "Q{} · {}",
-                self.settings.quality,
-                Settings::quality_hint(self.settings.quality)
-            ))
-            .small()
-            .color(MUTED),
-        );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Точно:").color(MUTED));
+                ui.add(
+                    egui::Slider::new(&mut self.settings.quality, 0..=10)
+                        .prefix("Q")
+                        .clamping(egui::SliderClamping::Always),
+                )
+                .on_hover_text("Чем выше Q, тем лучше звук и больше файл");
+            });
+            ui.label(
+                RichText::new(Settings::quality_hint(self.settings.quality))
+                    .small()
+                    .color(MUTED),
+            );
 
-        ui.add_space(12.0);
-        ui.label(RichText::new("Частота").small().color(MUTED));
-        ui.add_enabled_ui(!self.converting, |ui| {
+            ui.add_space(10.0);
+            ui.label(RichText::new("Каналы").color(MUTED));
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                for channels in [Channels::Mono, Channels::Stereo] {
+                    let selected = self.settings.channels == channels;
+                    if ui
+                        .add(
+                            egui::Button::new(channels.label())
+                                .selected(selected)
+                                .min_size(Vec2::new(width, 30.0)),
+                        )
+                        .on_hover_text(channels.hint())
+                        .clicked()
+                    {
+                        self.settings.channels = channels;
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.label(RichText::new("Частота дискретизации").color(MUTED));
             egui::ComboBox::from_id_salt("sample_rate")
-                .width(ui.available_width().min(220.0))
+                .width(ui.available_width())
                 .selected_text(self.settings.sample_rate.label())
                 .show_ui(ui, |ui| {
                     for rate in [SampleRate::Source, SampleRate::Hz44100, SampleRate::Hz48000] {
                         ui.selectable_value(&mut self.settings.sample_rate, rate, rate.label());
                     }
-                });
-        });
+                })
+                .response
+                .on_hover_text("Если не уверены — оставьте «Как в исходнике»");
 
-        ui.add_space(16.0);
-        ui.add_enabled(
-            !self.converting,
-            egui::Checkbox::new(&mut self.settings.recursive, "Искать во вложенных папках"),
-        );
-        ui.add_enabled(
-            !self.converting,
-            egui::Checkbox::new(&mut self.settings.overwrite, "Перезаписывать готовые OGG"),
-        );
+            ui.add_space(18.0);
+            step_title(ui, "3", "Куда сохранить");
+            ui.add_space(4.0);
+
+            let custom = self.settings.output_dir.is_some();
+            if choice_row(ui, !custom, "Рядом с исходными файлами", "").clicked()
+            {
+                self.settings.output_dir = None;
+            }
+            let custom_clicked = choice_row(ui, custom, "В одну папку…", "").clicked();
+            if custom_clicked {
+                if let Some(folder) = FileDialog::new().pick_folder() {
+                    self.settings.output_dir = Some(folder);
+                }
+            }
+
+            if let Some(dir) = self.settings.output_dir.clone() {
+                let text = dir.display().to_string();
+                Frame::none()
+                    .fill(PANEL_INNER)
+                    .rounding(Rounding::same(6.0))
+                    .inner_margin(Margin::symmetric(8.0, 6.0))
+                    .stroke(Stroke::new(1.0, STROKE))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .small_button("Изменить")
+                                    .on_hover_text("Выбрать другую папку")
+                                    .clicked()
+                                {
+                                    if let Some(folder) = FileDialog::new().pick_folder() {
+                                        self.settings.output_dir = Some(folder);
+                                    }
+                                }
+                                ui.add(
+                                    egui::Label::new(RichText::new(&text).color(TEXT).small())
+                                        .truncate(),
+                                )
+                                .on_hover_text(&text);
+                            });
+                        });
+                    });
+            }
+
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.settings.overwrite,
+                "Перезаписывать существующие OGG",
+            )
+            .on_hover_text("Если выключено, файлы, для которых OGG уже есть, будут пропущены");
+        });
     }
 
     fn ui_files(&mut self, ui: &mut egui::Ui) {
+        let enabled = !self.converting;
+        let stats = self.stats();
+
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("Файлы ({})", self.files.len()))
-                    .strong()
-                    .size(16.0)
-                    .color(TEXT),
-            );
+            step_title(ui, "1", "Файлы");
+            if !self.files.is_empty() {
+                ui.label(RichText::new(files_word(self.files.len())).color(MUTED));
+            }
+        });
+        ui.add_space(2.0);
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let enabled = !self.converting;
-
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(enabled, |ui| {
                 if ui
-                    .add_enabled(
-                        enabled && self.files.iter().any(|f| f.status == FileStatus::Failed),
-                        egui::Button::new("Убрать ошибки"),
-                    )
+                    .button("➕ Добавить файлы")
+                    .on_hover_text("Ctrl+O")
                     .clicked()
                 {
-                    self.files.retain(|f| f.status != FileStatus::Failed);
+                    self.pick_files();
                 }
-
                 if ui
-                    .add_enabled(
-                        enabled && !self.files.is_empty(),
-                        egui::Button::new("Очистить"),
-                    )
+                    .button("📁 Добавить папку")
+                    .on_hover_text("Ctrl+Shift+O")
                     .clicked()
                 {
-                    self.files.clear();
-                    self.total = 0;
-                    self.completed = 0;
-                    self.success_count = 0;
-                    self.fail_count = 0;
-                    self.skip_count = 0;
+                    self.pick_folder();
                 }
+                ui.checkbox(&mut self.settings.recursive, "С подпапками")
+                    .on_hover_text("При добавлении папки искать аудио и во вложенных папках");
 
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Папка…"))
-                    .on_hover_text("Добавить аудио из папки")
-                    .clicked()
-                {
-                    if let Some(folder) = FileDialog::new().pick_folder() {
-                        self.add_directory(folder);
-                    }
-                }
-
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Файлы…"))
-                    .on_hover_text("Добавить отдельные файлы")
-                    .clicked()
-                {
-                    if let Some(files) = FileDialog::new()
-                        .add_filter("Аудио", AUDIO_EXTENSIONS)
-                        .pick_files()
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!self.files.is_empty(), egui::Button::new("Очистить"))
+                        .on_hover_text("Убрать все файлы из списка (сами файлы не удаляются)")
+                        .clicked()
                     {
-                        for file in files {
-                            self.add_file(file);
-                        }
+                        self.files.clear();
+                        self.total = 0;
+                        self.completed = 0;
                     }
-                }
+                    if stats.failed > 0
+                        && ui
+                            .button("Убрать ошибки")
+                            .on_hover_text("Убрать из списка файлы с ошибкой")
+                            .clicked()
+                    {
+                        self.files.retain(|f| f.status != FileStatus::Failed);
+                    }
+                    if stats.success > 0
+                        && ui
+                            .button("Убрать готовые")
+                            .on_hover_text("Убрать из списка уже сконвертированные файлы")
+                            .clicked()
+                    {
+                        self.files.retain(|f| f.status != FileStatus::Success);
+                    }
+                });
             });
         });
 
-        if self.total > 0 {
-            ui.label(
-                RichText::new(format!(
-                    "готово {} · ошибок {} · пропуск {}",
-                    self.success_count, self.fail_count, self.skip_count
-                ))
-                .small()
-                .color(MUTED),
-            );
-        }
+        // Строка уведомления держит место всегда, чтобы список не прыгал.
+        ui.horizontal(|ui| {
+            ui.set_min_height(18.0);
+            if let Some(notice) = &self.notice {
+                ui.label(RichText::new(&notice.text).color(notice.color));
+            }
+        });
 
-        ui.add_space(8.0);
+        let list_rect = ui.available_rect_before_wrap();
 
         if self.files.is_empty() {
-            let drop_fill = if self.dragging {
-                Color32::from_rgba_unmultiplied(98, 168, 255, 28)
-            } else {
-                PANEL_INNER
-            };
-            Frame::none()
-                .fill(drop_fill)
-                .stroke(Stroke::new(
-                    1.0,
-                    if self.dragging { ACCENT } else { STROKE },
-                ))
-                .rounding(Rounding::same(10.0))
-                .inner_margin(Margin::same(24.0))
-                .show(ui, |ui| {
-                    ui.set_min_height((ui.available_height() - 8.0).max(120.0));
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.28);
-                        ui.label(
-                            RichText::new("Перетащите аудио сюда")
-                                .size(18.0)
-                                .color(if self.dragging { ACCENT } else { TEXT }),
-                        );
-                        ui.label(RichText::new("или нажмите «Файлы…» / «Папка…»").color(MUTED));
-                    });
-                });
+            self.ui_drop_zone(ui);
         } else {
-            ScrollArea::vertical()
-                .id_salt("file_list")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mut remove = None;
-                    for (index, file) in self.files.iter().enumerate() {
-                        let name = file
-                            .path
-                            .file_name()
-                            .and_then(|x| x.to_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let parent = file
-                            .path
-                            .parent()
-                            .unwrap_or(Path::new(""))
-                            .display()
-                            .to_string();
-
-                        Frame::none()
-                            .fill(PANEL_INNER)
-                            .rounding(Rounding::same(8.0))
-                            .inner_margin(Margin::symmetric(10.0, 6.0))
-                            .stroke(Stroke::new(1.0, STROKE))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("{:02}", index + 1))
-                                            .color(MUTED)
-                                            .monospace(),
-                                    );
-                                    ui.label(RichText::new(&name).color(TEXT))
-                                        .on_hover_text(&parent);
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if !self.converting
-                                                && ui
-                                                    .small_button("✕")
-                                                    .on_hover_text("Убрать из списка")
-                                                    .clicked()
-                                            {
-                                                remove = Some(index);
-                                            }
-                                            ui.label(
-                                                RichText::new(file.status.label())
-                                                    .small()
-                                                    .color(file.status.color()),
-                                            );
-                                        },
-                                    );
-                                });
-                            })
-                            .response
-                            .on_hover_text(if file.message.is_empty() {
-                                parent
-                            } else {
-                                format!("{parent}\n{}", file.message)
-                            });
-                        ui.add_space(4.0);
-                    }
-                    if let Some(index) = remove {
-                        self.files.remove(index);
-                    }
-                });
+            self.ui_file_list(ui);
+            if self.dragging {
+                paint_drop_overlay(ui, list_rect, self.converting);
+            }
         }
     }
 
-    fn ui_destination(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Сохранять OGG").small().color(MUTED));
+    fn ui_drop_zone(&mut self, ui: &mut egui::Ui) {
+        let (fill, stroke) = if self.dragging {
+            (Color32::from_rgba_unmultiplied(98, 168, 255, 24), ACCENT)
+        } else {
+            (PANEL_INNER, STROKE)
+        };
+        Frame::none()
+            .fill(fill)
+            .stroke(Stroke::new(1.5, stroke))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::same(24.0))
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size() - Vec2::splat(4.0));
+                ui.vertical_centered(|ui| {
+                    ui.add_space((ui.available_height() * 0.5 - 90.0).max(0.0));
+                    ui.label(RichText::new("🎵").size(40.0).color(MUTED));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(if self.dragging {
+                            "Отпустите, чтобы добавить"
+                        } else {
+                            "Перетащите сюда аудиофайлы или папки"
+                        })
+                        .size(18.0)
+                        .color(if self.dragging { ACCENT } else { TEXT }),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("MP3, M4A, WAV, FLAC, AAC, OGG, OPUS, WMA, AIFF и др.")
+                            .color(MUTED),
+                    );
+                    ui.add_space(14.0);
+
+                    let button_size = Vec2::new(170.0, 34.0);
+                    let total = button_size.x * 2.0 + ui.spacing().item_spacing.x;
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(total, button_size.y),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new("Выбрать файлы…")
+                                        .fill(ACCENT_SOFT)
+                                        .min_size(button_size),
+                                )
+                                .clicked()
+                            {
+                                self.pick_files();
+                            }
+                            if ui
+                                .add(egui::Button::new("Выбрать папку…").min_size(button_size))
+                                .clicked()
+                            {
+                                self.pick_folder();
+                            }
+                        },
+                    );
+                });
+            });
+    }
+
+    fn ui_file_list(&mut self, ui: &mut egui::Ui) {
+        let mut remove = None;
+        let converting = self.converting;
+
+        ScrollArea::vertical()
+            .id_salt("file_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (index, file) in self.files.iter().enumerate() {
+                    let name = file_name(&file.path);
+                    let parent = file
+                        .path
+                        .parent()
+                        .unwrap_or(Path::new(""))
+                        .display()
+                        .to_string();
+
+                    let (detail, detail_color) = match file.status {
+                        FileStatus::Failed => (file.message.clone(), ERR),
+                        FileStatus::Skipped => (file.message.clone(), WARN),
+                        FileStatus::Success => (format!("→ {}", file.message), MUTED),
+                        _ => (parent.clone(), MUTED),
+                    };
+
+                    let fill = if file.status == FileStatus::Running {
+                        SELECTED_BG
+                    } else {
+                        PANEL_INNER
+                    };
+
+                    let row = Frame::none()
+                        .fill(fill)
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::symmetric(10.0, 6.0))
+                        .stroke(Stroke::new(
+                            1.0,
+                            if file.status == FileStatus::Failed {
+                                Color32::from_rgb(92, 46, 54)
+                            } else {
+                                STROKE
+                            },
+                        ))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [18.0, 18.0],
+                                    egui::Label::new(
+                                        RichText::new(file.status.icon())
+                                            .color(file.status.color()),
+                                    ),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if !converting
+                                        && ui
+                                            .small_button("✖")
+                                            .on_hover_text("Убрать из списка")
+                                            .clicked()
+                                    {
+                                        remove = Some(index);
+                                    }
+                                    if file.status == FileStatus::Running {
+                                        ui.spinner();
+                                    }
+                                    ui.label(
+                                        RichText::new(file.status.label())
+                                            .small()
+                                            .color(file.status.color()),
+                                    );
+                                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        ui.add(
+                                            egui::Label::new(RichText::new(&name).color(TEXT))
+                                                .truncate(),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&detail).small().color(detail_color),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                });
+                            });
+                        });
+
+                    let mut tip = file.path.display().to_string();
+                    if !file.message.is_empty() {
+                        tip.push_str("\n\n");
+                        tip.push_str(&file.message);
+                    }
+                    row.response.on_hover_text(tip);
+                    ui.add_space(3.0);
+                }
+            });
+
+        if let Some(index) = remove {
+            self.files.remove(index);
+        }
+    }
+
+    fn ui_footer(&mut self, ui: &mut egui::Ui) {
+        let stats = self.stats();
+        let to_convert = self.files_to_convert();
+        let ffmpeg_ready = self.ffmpeg_path().is_some();
+
         ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.set_min_height(44.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Главная кнопка: «Конвертировать» или «Стоп» на её месте.
+                let big = Vec2::new(230.0, 40.0);
+                if self.converting {
+                    let label = if self.stopping {
+                        "Останавливаю…"
+                    } else {
+                        "⏹ Остановить"
+                    };
+                    if ui
+                        .add_enabled(
+                            !self.stopping,
+                            egui::Button::new(RichText::new(label).strong().size(16.0))
+                                .fill(STOP_BG)
+                                .min_size(big),
+                        )
+                        .on_hover_text("Остановить после текущего файла (Esc)")
+                        .clicked()
+                    {
+                        self.request_cancel();
+                    }
+                } else {
+                    let label = if self.files.is_empty() {
+                        "Конвертировать".to_string()
+                    } else if stats.success == self.files.len() {
+                        format!("Конвертировать заново ({to_convert})")
+                    } else if stats.success > 0 {
+                        format!("Конвертировать остальные ({to_convert})")
+                    } else {
+                        format!("Конвертировать ({to_convert})")
+                    };
+                    let can_convert = !self.files.is_empty() && ffmpeg_ready;
+                    let response = ui
+                        .add_enabled(
+                            can_convert,
+                            egui::Button::new(RichText::new(label).strong().size(16.0))
+                                .fill(if can_convert {
+                                    ACCENT_SOFT
+                                } else {
+                                    PANEL_INNER
+                                })
+                                .min_size(big),
+                        )
+                        .on_hover_text("Ctrl+Enter")
+                        .on_disabled_hover_text(if self.files.is_empty() {
+                            "Сначала добавьте файлы"
+                        } else {
+                            "FFmpeg ещё не готов"
+                        });
+                    if response.clicked() {
+                        self.start_conversion();
+                    }
+                }
+
+                let open_target = self.output_folder_to_open();
                 if ui
                     .add_enabled(
-                        self.output_folder_to_open().is_some(),
-                        egui::Button::new("Открыть"),
+                        open_target.is_some(),
+                        egui::Button::new("📂 Открыть папку").min_size(Vec2::new(0.0, 40.0)),
                     )
-                    .on_hover_text("Открыть папку с результатом")
+                    .on_hover_text("Открыть папку с готовыми OGG")
                     .clicked()
                 {
-                    if let Some(dir) = self.output_folder_to_open() {
+                    if let Some(dir) = open_target {
                         Self::open_path(&dir);
                     }
                 }
 
+                let log_label = if self.log_open {
+                    "Журнал ▾"
+                } else {
+                    "Журнал ▸"
+                };
                 if ui
-                    .add_enabled(
-                        !self.converting && self.output_dir.is_some(),
-                        egui::Button::new("Как у исходника"),
+                    .add(
+                        egui::Button::new(log_label)
+                            .selected(self.log_open)
+                            .min_size(Vec2::new(0.0, 40.0)),
                     )
-                    .on_hover_text("Писать OGG рядом с каждым исходным файлом")
+                    .on_hover_text("Подробный журнал событий")
                     .clicked()
                 {
-                    self.output_dir = None;
-                    self.save_settings();
+                    self.log_open = !self.log_open;
                 }
 
-                if ui
-                    .add_enabled(!self.converting, egui::Button::new("Выбрать…"))
-                    .on_hover_text("Все файлы в одну папку")
-                    .clicked()
-                {
-                    if let Some(folder) = FileDialog::new().pick_folder() {
-                        self.output_dir = Some(folder);
-                        self.save_settings();
-                    }
-                }
-
-                let text = self
-                    .output_dir
-                    .as_ref()
-                    .map(|x| x.display().to_string())
-                    .unwrap_or_else(|| "Рядом с каждым исходным файлом".to_string());
-
-                Frame::none()
-                    .fill(PANEL_INNER)
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::symmetric(10.0, 6.0))
-                    .stroke(Stroke::new(1.0, STROKE))
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.label(RichText::new(ellipsize(&text, 72)).color(TEXT))
-                            .on_hover_text(&text);
-                    });
+                ui.add_space(8.0);
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    self.ui_footer_status(ui, &stats);
+                });
             });
         });
     }
 
+    fn ui_footer_status(&self, ui: &mut egui::Ui, stats: &Stats) {
+        if self.converting {
+            let current = self
+                .current_file
+                .as_deref()
+                .map(file_name)
+                .unwrap_or_default();
+            let headline = if self.stopping {
+                "Останавливаю после текущего файла…".to_string()
+            } else {
+                format!("{} из {} · {current}", self.completed + 1, self.total)
+            };
+            ui.add(egui::Label::new(RichText::new(headline).color(TEXT)).truncate());
+            let progress = if self.total == 0 {
+                0.0
+            } else {
+                self.completed as f32 / self.total as f32
+            };
+            ui.add(
+                egui::ProgressBar::new(progress)
+                    .desired_width(ui.available_width())
+                    .desired_height(10.0)
+                    .animate(true),
+            );
+            return;
+        }
+
+        if self.files.is_empty() {
+            ui.label(RichText::new("Добавьте файлы, чтобы начать").color(MUTED));
+            return;
+        }
+
+        if self.total > 0 {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("✔ готово {}", stats.success)).color(OK));
+                if stats.failed > 0 {
+                    ui.label(RichText::new(format!("✖ ошибок {}", stats.failed)).color(ERR));
+                }
+                if stats.skipped > 0 {
+                    ui.label(RichText::new(format!("⏭ пропущено {}", stats.skipped)).color(WARN));
+                }
+                if stats.queued > 0 {
+                    ui.label(RichText::new(format!("○ ожидают {}", stats.queued)).color(MUTED));
+                }
+            });
+        }
+
+        let destination = match &self.settings.output_dir {
+            Some(dir) => format!("в {}", dir.display()),
+            None => "рядом с исходниками".to_string(),
+        };
+        let summary = format!(
+            "OGG Vorbis · Q{} (≈{} кбит/с) · {} · {destination}",
+            self.settings.quality,
+            Settings::quality_kbps(self.settings.quality),
+            self.settings.channels.label().to_lowercase(),
+        );
+        ui.add(egui::Label::new(RichText::new(summary).color(MUTED)).truncate());
+    }
+
     fn ui_logs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Журнал").strong().size(14.0).color(TEXT));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new("Журнал").strong().color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Скрыть").clicked() {
+                    self.log_open = false;
+                }
                 if ui.small_button("Очистить").clicked() {
                     self.logs.clear();
                 }
             });
         });
-        ui.add_space(4.0);
 
         Frame::none()
             .fill(PANEL_INNER)
-            .rounding(Rounding::same(8.0))
+            .rounding(Rounding::same(6.0))
             .inner_margin(Margin::same(8.0))
             .stroke(Stroke::new(1.0, STROKE))
             .show(ui, |ui| {
                 ScrollArea::vertical()
                     .id_salt("logs")
-                    .max_height(132.0)
-                    .min_scrolled_height(132.0)
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         if self.logs.is_empty() {
-                            ui.label(
-                                RichText::new("Пока пусто — события конвертации появятся здесь.")
-                                    .color(MUTED),
+                            ui.label(RichText::new("Пока пусто.").color(MUTED));
+                        }
+                        for (color, line) in &self.logs {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(line).color(*color).monospace().size(12.0),
+                                )
+                                .wrap(),
                             );
-                        } else {
-                            for (color, line) in &self.logs {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(line).color(*color).monospace().size(12.0),
-                                    )
-                                    .wrap(),
-                                );
-                            }
                         }
                     });
             });
     }
+}
 
-    fn ui_actions(&mut self, ui: &mut egui::Ui) {
-        let progress = if self.total == 0 {
-            0.0
+fn step_title(ui: &mut egui::Ui, number: &str, title: &str) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), 11.0, ACCENT_SOFT);
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            number,
+            FontId::proportional(13.0),
+            TEXT,
+        );
+        ui.label(RichText::new(title).strong().size(16.0).color(TEXT));
+    });
+}
+
+/// Строка-переключатель на всю ширину: название слева, пояснение справа.
+fn choice_row(ui: &mut egui::Ui, selected: bool, title: &str, right: &str) -> egui::Response {
+    let size = Vec2::new(ui.available_width(), 30.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let enabled = ui.is_enabled();
+    let response = response.on_hover_cursor(if enabled {
+        egui::CursorIcon::PointingHand
+    } else {
+        egui::CursorIcon::Default
+    });
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let fill = if selected {
+            SELECTED_BG
+        } else if response.hovered() && enabled {
+            ROW_HOVER
         } else {
-            self.completed as f32 / self.total as f32
+            Color32::TRANSPARENT
         };
+        let stroke = if selected { ACCENT_SOFT } else { STROKE };
+        painter.rect(rect, Rounding::same(6.0), fill, Stroke::new(1.0, stroke));
 
-        ui.horizontal(|ui| {
-            let can_convert =
-                !self.converting && !self.files.is_empty() && self.ffmpeg_path.is_some();
+        let dim = |c: Color32| if enabled { c } else { c.gamma_multiply(0.5) };
 
-            let convert = ui.add_enabled(
-                can_convert,
-                egui::Button::new(RichText::new("Конвертировать").strong().size(16.0))
-                    .fill(if can_convert {
-                        ACCENT_SOFT
-                    } else {
-                        PANEL_INNER
-                    })
-                    .min_size(Vec2::new(200.0, 40.0)),
-            );
-            if convert.clicked() {
-                self.save_settings();
-                self.start_conversion();
-            }
-
-            if self.converting
-                && ui
-                    .add(
-                        egui::Button::new("Стоп")
-                            .fill(Color32::from_rgb(90, 40, 48))
-                            .min_size(Vec2::new(88.0, 40.0)),
-                    )
-                    .clicked()
-            {
-                self.request_cancel();
-            }
-
-            ui.add(
-                egui::ProgressBar::new(progress)
-                    .desired_width(ui.available_width())
-                    .desired_height(18.0)
-                    .text(if self.total == 0 {
-                        "Добавьте файлы".to_string()
-                    } else {
-                        format!("{} / {}", self.completed, self.total)
-                    })
-                    .animate(self.converting),
-            );
-        });
-    }
-
-    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        self.dragging = ctx.input(|input| !input.raw.hovered_files.is_empty());
-        if self.converting {
-            return;
+        // Радио-кружок.
+        let dot = egui::pos2(rect.left() + 14.0, rect.center().y);
+        painter.circle_stroke(
+            dot,
+            6.0,
+            Stroke::new(1.5, dim(if selected { ACCENT } else { MUTED })),
+        );
+        if selected {
+            painter.circle_filled(dot, 3.0, dim(ACCENT));
         }
-        let dropped_files = ctx.input(|input| input.raw.dropped_files.clone());
-        for file in dropped_files {
-            if let Some(path) = file.path {
-                self.add_file(path);
-            }
+
+        painter.text(
+            egui::pos2(rect.left() + 28.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            TextStyle::Body.resolve(ui.style()),
+            dim(TEXT),
+        );
+        if !right.is_empty() {
+            painter.text(
+                egui::pos2(rect.right() - 10.0, rect.center().y),
+                Align2::RIGHT_CENTER,
+                right,
+                TextStyle::Small.resolve(ui.style()),
+                dim(MUTED),
+            );
         }
     }
+    ui.add_space(2.0);
+    response
+}
+
+fn paint_drop_overlay(ui: &egui::Ui, rect: egui::Rect, blocked: bool) {
+    let painter = ui.painter_at(rect);
+    let (color, text) = if blocked {
+        (ERR, "Во время конвертации добавлять файлы нельзя")
+    } else {
+        (ACCENT, "Отпустите, чтобы добавить в список")
+    };
+    painter.rect(
+        rect.shrink(2.0),
+        Rounding::same(10.0),
+        Color32::from_rgba_unmultiplied(12, 14, 20, 220),
+        Stroke::new(1.5, color),
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::proportional(18.0),
+        color,
+    );
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or("файл")
+        .to_string()
+}
+
+fn files_word(count: usize) -> String {
+    let word = match (count % 10, count % 100) {
+        (1, n) if n != 11 => "файл",
+        (2..=4, n) if !(12..=14).contains(&n) => "файла",
+        _ => "файлов",
+    };
+    format!("{count} {word}")
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -991,46 +1499,49 @@ fn apply_theme(ctx: &egui::Context) {
 
     let mut visuals = egui::Visuals::dark();
     visuals.dark_mode = true;
-    visuals.window_fill = BG;
+    visuals.window_fill = PANEL;
     visuals.panel_fill = BG;
     visuals.extreme_bg_color = PANEL_INNER;
     visuals.faint_bg_color = PANEL;
     visuals.override_text_color = Some(TEXT);
     visuals.hyperlink_color = ACCENT;
-    visuals.selection.bg_fill = Color32::from_rgb(48, 92, 168);
+    visuals.selection.bg_fill = SELECTED_BG;
+    visuals.selection.stroke = Stroke::new(1.0, ACCENT);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, MUTED);
     visuals.widgets.inactive.bg_fill = Color32::from_rgb(34, 40, 54);
     visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(34, 40, 54);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-    visuals.widgets.inactive.rounding = Rounding::same(8.0);
+    visuals.widgets.inactive.rounding = Rounding::same(6.0);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, STROKE);
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(48, 62, 88);
     visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(48, 62, 88);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-    visuals.widgets.hovered.rounding = Rounding::same(8.0);
-    visuals.widgets.active.bg_fill = ACCENT_SOFT;
-    visuals.widgets.active.rounding = Rounding::same(8.0);
-    visuals.widgets.open.bg_fill = Color32::from_rgb(40, 50, 70);
-    visuals.widgets.open.rounding = Rounding::same(8.0);
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, STROKE);
+    visuals.widgets.hovered.rounding = Rounding::same(6.0);
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+    visuals.widgets.active.bg_fill = ACCENT_SOFT;
+    visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
+    visuals.widgets.active.rounding = Rounding::same(6.0);
+    visuals.widgets.open.bg_fill = Color32::from_rgb(40, 50, 70);
+    visuals.widgets.open.rounding = Rounding::same(6.0);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
+    visuals.window_rounding = Rounding::same(8.0);
     ctx.set_visuals(visuals);
 
     ctx.style_mut(|style| {
-        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-        style.spacing.button_padding = Vec2::new(12.0, 7.0);
-        style.spacing.window_margin = Margin::same(0.0);
-        style.visuals.window_rounding = Rounding::same(12.0);
+        use egui::FontFamily::{Monospace, Proportional};
+        style.text_styles = [
+            (TextStyle::Heading, FontId::new(20.0, Proportional)),
+            (TextStyle::Body, FontId::new(14.0, Proportional)),
+            (TextStyle::Button, FontId::new(14.0, Proportional)),
+            (TextStyle::Small, FontId::new(12.0, Proportional)),
+            (TextStyle::Monospace, FontId::new(12.5, Monospace)),
+        ]
+        .into();
+        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+        style.spacing.button_padding = Vec2::new(12.0, 6.0);
+        style.spacing.interact_size.y = 26.0;
+        style.spacing.slider_width = 150.0;
     });
-}
-
-fn ellipsize(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        return text.to_string();
-    }
-    let skip = count.saturating_sub(max_chars.saturating_sub(1));
-    format!("…{}", text.chars().skip(skip).collect::<String>())
 }
 
 fn prepend_path(dir: &Path) {
@@ -1222,6 +1733,19 @@ impl eframe::App for App {
         self.poll_ffmpeg();
         self.poll_conversion();
         self.handle_dropped_files(ctx);
+        self.handle_shortcuts(ctx);
+
+        let now = ctx.input(|i| i.time);
+        if let Some((color, text)) = self.pending_notice.take() {
+            self.notice = Some(Notice {
+                color,
+                text,
+                until: now + NOTICE_SECONDS,
+            });
+        }
+        if self.notice.as_ref().is_some_and(|n| n.until <= now) {
+            self.notice = None;
+        }
 
         egui::TopBottomPanel::top("header")
             .frame(
@@ -1239,20 +1763,32 @@ impl eframe::App for App {
             .frame(
                 Frame::none()
                     .fill(PANEL)
-                    .inner_margin(Margin::symmetric(16.0, 12.0))
+                    .inner_margin(Margin::symmetric(16.0, 10.0))
                     .stroke(Stroke::new(1.0, STROKE)),
             )
             .show(ctx, |ui| {
-                self.ui_destination(ui);
-                ui.add_space(10.0);
-                self.ui_actions(ui);
-                ui.add_space(10.0);
-                self.ui_logs(ui);
+                self.ui_footer(ui);
             });
+
+        if self.log_open {
+            egui::TopBottomPanel::bottom("log")
+                .resizable(true)
+                .default_height(170.0)
+                .height_range(90.0..=400.0)
+                .frame(
+                    Frame::none()
+                        .fill(PANEL)
+                        .inner_margin(Margin::symmetric(16.0, 8.0))
+                        .stroke(Stroke::new(1.0, STROKE)),
+                )
+                .show(ctx, |ui| {
+                    self.ui_logs(ui);
+                });
+        }
 
         egui::SidePanel::right("settings")
             .resizable(false)
-            .exact_width(280.0)
+            .exact_width(300.0)
             .frame(
                 Frame::none()
                     .fill(PANEL)
@@ -1260,7 +1796,12 @@ impl eframe::App for App {
                     .stroke(Stroke::new(1.0, STROKE)),
             )
             .show(ctx, |ui| {
-                self.ui_settings(ui);
+                ScrollArea::vertical()
+                    .id_salt("settings_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.ui_settings(ui);
+                    });
             });
 
         egui::CentralPanel::default()
@@ -1269,8 +1810,12 @@ impl eframe::App for App {
                 self.ui_files(ui);
             });
 
+        self.save_settings();
+
         if self.converting || self.dragging || self.ffmpeg_rx.is_some() {
-            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if let Some(notice) = &self.notice {
+            ctx.request_repaint_after(Duration::from_secs_f64((notice.until - now).max(0.05)));
         }
     }
 
@@ -1282,9 +1827,10 @@ impl eframe::App for App {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 780.0])
-            .with_min_inner_size([880.0, 620.0])
-            .with_title("Schrodinger Audio Converter"),
+            .with_inner_size([1100.0, 740.0])
+            .with_min_inner_size([900.0, 600.0])
+            .with_title("Schrödinger — конвертер в OGG")
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 
