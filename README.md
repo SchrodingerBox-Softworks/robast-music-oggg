@@ -11,6 +11,7 @@
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-informational?style=flat-square)
 [![egui](https://img.shields.io/badge/GUI-egui-blue?style=flat-square)](https://github.com/emilk/egui)
 [![FFmpeg](https://img.shields.io/badge/powered%20by-FFmpeg-007808?style=flat-square&logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
+[![AI assisted](https://img.shields.io/badge/AI%20assisted-Claude%20Code%20%7C%20Cursor-d97757?style=flat-square&logo=claude&logoColor=white)](#разработка-с-помощью-ии)
 
 Настольное приложение для пакетной конвертации аудио в **OGG Vorbis**. Перетащите файлы или папки в окно, выберите качество и нажмите «Конвертировать».
 
@@ -105,3 +106,7 @@ git tag -a v0.1.1 -m "v0.1.1"
 ```bash
 git push origin v0.1.1
 ```
+
+## Разработка с помощью ИИ
+
+В разработке этого репозитория участвовали ИИ-агенты: [Claude Code](https://claude.com/claude-code) (Anthropic) и [Cursor](https://cursor.com). Они писали и правили код, интерфейс, CI и документацию под руководством автора. Коммиты с их участием помечены строкой `Co-Authored-By`.
