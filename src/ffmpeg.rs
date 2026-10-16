@@ -64,23 +64,15 @@ pub fn prepare() -> Result<PathBuf, String> {
 }
 
 fn cache_dir() -> Result<PathBuf, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let base = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| env::temp_dir());
-        return Ok(base.join("schrodinger-audio-converter").join("ffmpeg"));
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let base = env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| env::temp_dir());
-        Ok(base
-            .join(".local/share/schrodinger-audio-converter")
-            .join("ffmpeg"))
-    }
+    let (base_var, app_dir) = if cfg!(target_os = "windows") {
+        ("LOCALAPPDATA", "schrodinger-audio-converter")
+    } else {
+        ("HOME", ".local/share/schrodinger-audio-converter")
+    };
+    let base = env::var_os(base_var)
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+    Ok(base.join(app_dir).join("ffmpeg"))
 }
 
 fn find_local_install() -> Option<PathBuf> {
@@ -205,26 +197,23 @@ fn copy_dir_files(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 fn download_static(dest: &Path) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        let zip_path = dest
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("ffmpeg-download.zip");
-        download_file(WIN_FFMPEG_ZIP, &zip_path)?;
-        extract_ffmpeg_from_zip(&zip_path, dest)?;
-        let _ = fs::remove_file(zip_path);
-        return Ok(());
-    }
+    let zip_path = dest
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("ffmpeg-download.zip");
+    download_file(WIN_FFMPEG_ZIP, &zip_path)?;
+    extract_ffmpeg_from_zip(&zip_path, dest)?;
+    let _ = fs::remove_file(zip_path);
+    Ok(())
+}
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = dest;
-        Err(
-            "Автоскачивание FFmpeg есть только для Windows. Положите бинарник ffmpeg в assets/ffmpeg/linux/.".into(),
-        )
-    }
+#[cfg(not(target_os = "windows"))]
+fn download_static(_dest: &Path) -> Result<(), String> {
+    Err(
+        "Автоскачивание FFmpeg есть только для Windows. Положите бинарник ffmpeg в assets/ffmpeg/linux/.".into(),
+    )
 }
 
 #[cfg(target_os = "windows")]

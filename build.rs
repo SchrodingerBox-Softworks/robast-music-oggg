@@ -84,7 +84,6 @@ fn download_ffmpeg(dest: &Path) {
         download_file(url, &zip_path);
         extract_win_ffmpeg(&zip_path, dest);
         let _ = fs::remove_file(zip_path);
-        return;
     }
 
     #[cfg(not(target_os = "windows"))]
